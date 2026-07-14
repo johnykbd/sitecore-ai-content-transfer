@@ -142,7 +142,10 @@ export function redactEnvironment(env: EnvironmentProfile) {
  * into a user's account. The file is renamed afterwards so it only runs once.
  */
 export async function importLegacyEnvironments(userId: string): Promise<number> {
-  const file = path.join(process.cwd(), "data", "environments.json");
+  const file = path.join(
+    process.env.CT_DATA_DIR ?? path.join(process.cwd(), "data"),
+    "environments.json"
+  );
   if (!existsSync(file)) return 0;
   let imported = 0;
   try {

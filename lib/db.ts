@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "fs";
 import path from "path";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+const DATA_DIR = process.env.CT_DATA_DIR ?? path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "app.db");
 
 declare global {

@@ -20,7 +20,10 @@ import {
 import { appendFileSync, existsSync, readFileSync } from "fs";
 import path from "path";
 
-const LEGACY_KEY_FILE = path.join(process.cwd(), "data", ".secret.key");
+const LEGACY_KEY_FILE = path.join(
+  process.env.CT_DATA_DIR ?? path.join(process.cwd(), "data"),
+  ".secret.key"
+);
 const ENV_LOCAL_FILE = path.join(process.cwd(), ".env.local");
 const ENV_VAR = "CT_SECRET_KEY";
 
@@ -58,7 +61,15 @@ function getAppKey(): Buffer {
 
   // 3. Dev convenience: generate once into .env.local (gitignored)
   const hex = randomBytes(32).toString("hex");
-  appendFileSync(ENV_LOCAL_FILE, `\n# Auto-generated encryption key for saved credentials\n${ENV_VAR}=${hex}\n`);
+  try {
+    appendFileSync(ENV_LOCAL_FILE, `\n# Auto-generated encryption key for saved credentials\n${ENV_VAR}=${hex}\n`);
+  } catch {
+    // Read-only filesystem (e.g. serverless): keep the key in memory only.
+    console.warn(
+      `[crypto] Could not persist the generated key to .env.local (read-only filesystem). ` +
+        `Set ${ENV_VAR} explicitly — otherwise encrypted data is lost on every restart.`
+    );
+  }
   process.env[ENV_VAR] = hex;
   console.warn(
     `[crypto] ${ENV_VAR} was not set — generated a new key and saved it to .env.local. ` +

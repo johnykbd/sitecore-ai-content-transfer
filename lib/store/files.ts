@@ -1,7 +1,8 @@
 import { promises as fs } from "fs";
 import path from "path";
 
-export const DATA_DIR = path.join(process.cwd(), "data");
+/** Base data directory. Override with CT_DATA_DIR (e.g. /tmp/ct-data on read-only hosts). */
+export const DATA_DIR = process.env.CT_DATA_DIR ?? path.join(process.cwd(), "data");
 export const LOGS_DIR = path.join(DATA_DIR, "logs");
 export const MIGRATIONS_DIR = path.join(DATA_DIR, "migrations");
 export const ENVIRONMENTS_FILE = path.join(DATA_DIR, "environments.json");
