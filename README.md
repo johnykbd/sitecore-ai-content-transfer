@@ -22,7 +22,7 @@ for each. Nothing is written to disk:
 Register with email & password to unlock the full experience:
 
 - **Accounts & sessions** — passwords hashed with scrypt; httpOnly cookie sessions (7-day TTL). Stored in a local SQLite database at `data/app.db` (uses Node's built-in `node:sqlite` — **Node.js ≥ 22.5 required**).
-- **Unlimited saved environments** — per user, with **either** OAuth client ID + secret **or** a whole access token. Secrets/tokens are encrypted at rest with **AES-256-GCM** (key auto-generated at `data/.secret.key`) and never sent back to the browser.
+- **Unlimited saved environments** — per user, with **either** OAuth client ID + secret **or** a whole access token. Secrets/tokens are encrypted at rest with **AES-256-GCM** (key from the `CT_SECRET_KEY` env variable) and never sent back to the browser.
 - **Full migration history** — every migration and its complete JSON log saved under `data/migrations/` and `data/logs/migration-{id}.log.json`, downloadable from the UI.
 - **Legacy import** — if a `data/environments.json` file exists, the first account registered imports those environments (encrypted into the DB) and the file is renamed to `.imported`.
 
@@ -56,6 +56,7 @@ paths there and adjust if needed — each one can also be overridden with an env
 
 | Variable | Default |
 | --- | --- |
+| `CT_SECRET_KEY` | *(none — see Security notes)* 64-hex-char AES-256 key for encrypting saved credentials |
 | `SITECORE_AUTHORITY` | `https://auth.sitecorecloud.io` |
 | `SITECORE_AUDIENCE` | `https://api.sitecorecloud.io` |
 | `SITECORE_CT_BASE` | `/sitecore/api/content/transfer/v1` |
@@ -69,7 +70,8 @@ paths there and adjust if needed — each one can also be overridden with an env
 
 ## Security notes
 
-- Managed credentials are AES-256-GCM encrypted in SQLite; the key file `data/.secret.key` should be kept out of version control (as should the whole `data/` folder).
+- Managed credentials are AES-256-GCM encrypted in SQLite. The key comes from the `CT_SECRET_KEY` environment variable (generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`). If unset in development, a key is auto-generated into `.env.local` (gitignored). A legacy `data/.secret.key` file is still honored for older installs. **Losing the key makes stored credentials unreadable.**
+- The `data/` folder (SQLite DB, logs) and all `.env*` files are gitignored — never commit them.
 - API routes for environments and managed migrations require a valid session and enforce per-user ownership.
 - One-time mode never persists tokens or logs; access tokens typically expire, so paste a fresh one per run.
 

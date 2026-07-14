@@ -3,8 +3,12 @@
  *  - scrypt password hashing (user accounts)
  *  - AES-256-GCM encryption for environment credentials at rest
  *
- * The encryption key is generated once and stored in data/.secret.key.
- * Keep that file out of source control (data/ is gitignored).
+ * The encryption key comes from the CT_SECRET_KEY environment variable
+ * (64 hex chars = 32 bytes). Resolution order:
+ *   1. process.env.CT_SECRET_KEY            (recommended for production)
+ *   2. legacy data/.secret.key file          (backwards compatibility)
+ *   3. auto-generated and appended to .env.local (dev convenience;
+ *      .env* is gitignored so it never reaches source control)
  */
 import {
   createCipheriv,
@@ -13,21 +17,54 @@ import {
   scryptSync,
   timingSafeEqual,
 } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, readFileSync } from "fs";
 import path from "path";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const KEY_FILE = path.join(DATA_DIR, ".secret.key");
+const LEGACY_KEY_FILE = path.join(process.cwd(), "data", ".secret.key");
+const ENV_LOCAL_FILE = path.join(process.cwd(), ".env.local");
+const ENV_VAR = "CT_SECRET_KEY";
 
 let cachedKey: Buffer | null = null;
 
+function parseKey(hex: string, source: string): Buffer {
+  const key = Buffer.from(hex.trim(), "hex");
+  if (key.length !== 32) {
+    throw new Error(
+      `${source} must be 64 hex characters (32 bytes); got ${key.length} bytes. ` +
+        `Generate one with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+    );
+  }
+  return key;
+}
+
 function getAppKey(): Buffer {
   if (cachedKey) return cachedKey;
-  mkdirSync(DATA_DIR, { recursive: true });
-  if (!existsSync(KEY_FILE)) {
-    writeFileSync(KEY_FILE, randomBytes(32).toString("hex"), { mode: 0o600 });
+
+  // 1. Environment variable (recommended)
+  if (process.env[ENV_VAR]) {
+    cachedKey = parseKey(process.env[ENV_VAR], ENV_VAR);
+    return cachedKey;
   }
-  cachedKey = Buffer.from(readFileSync(KEY_FILE, "utf8").trim(), "hex");
+
+  // 2. Legacy key file (kept so existing encrypted data stays readable)
+  if (existsSync(LEGACY_KEY_FILE)) {
+    cachedKey = parseKey(readFileSync(LEGACY_KEY_FILE, "utf8"), LEGACY_KEY_FILE);
+    console.warn(
+      `[crypto] Using legacy key file at ${LEGACY_KEY_FILE}. ` +
+        `Move its value to the ${ENV_VAR} environment variable and delete the file.`
+    );
+    return cachedKey;
+  }
+
+  // 3. Dev convenience: generate once into .env.local (gitignored)
+  const hex = randomBytes(32).toString("hex");
+  appendFileSync(ENV_LOCAL_FILE, `\n# Auto-generated encryption key for saved credentials\n${ENV_VAR}=${hex}\n`);
+  process.env[ENV_VAR] = hex;
+  console.warn(
+    `[crypto] ${ENV_VAR} was not set — generated a new key and saved it to .env.local. ` +
+      `For production, set ${ENV_VAR} yourself and keep it safe: losing it makes stored credentials unreadable.`
+  );
+  cachedKey = parseKey(hex, ENV_VAR);
   return cachedKey;
 }
 
