@@ -15,9 +15,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Loader2, LogIn, ShieldCheck, UserPlus } from "lucide-react";
+import { useAuth } from "@/lib/use-auth";
 
 export function AuthForm({ mode }: { mode: "login" | "register" }) {
   const router = useRouter();
+  const { refresh } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -45,6 +47,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
       } else {
         toast.success(mode === "register" ? "Account created." : "Signed in.");
       }
+      await refresh();
       router.push("/");
       router.refresh();
     } catch (err) {

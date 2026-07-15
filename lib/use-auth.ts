@@ -1,39 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { useAuthContext } from "./auth-context";
 
-export interface AuthUser {
-  id: string;
-  email: string;
-}
+export type { AuthUser } from "./auth-context";
 
 export function useAuth() {
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  const refresh = useCallback(async () => {
-    try {
-      const res = await fetch("/api/auth/me");
-      const json = await res.json();
-      setUser(json.user ?? null);
-    } catch {
-      setUser(null);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  return { user, loading, refresh };
+  return useAuthContext();
 }
 
 /** Redirects to /login when the visitor is not signed in. */
 export function useRequireAuth() {
-  const { user, loading, refresh } = useAuth();
+  const { user, loading, refresh } = useAuthContext();
   const router = useRouter();
 
   useEffect(() => {
