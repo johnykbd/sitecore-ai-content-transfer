@@ -21,10 +21,18 @@ for each. Nothing is written to disk:
 
 Register with email & password to unlock the full experience:
 
-- **Accounts & sessions** — passwords hashed with scrypt; httpOnly cookie sessions (7-day TTL). Stored in a local SQLite database at `data/app.db` (uses Node's built-in `node:sqlite` — **Node.js ≥ 22.5 required**).
+- **Accounts & sessions** — passwords hashed with scrypt; httpOnly cookie sessions (7-day TTL). Stored in Postgres (see [Database](#database) below).
 - **Unlimited saved environments** — per user, with **either** OAuth client ID + secret **or** a whole access token. Secrets/tokens are encrypted at rest with **AES-256-GCM** (key from the `CT_SECRET_KEY` env variable) and never sent back to the browser.
-- **Full migration history** — every migration and its complete JSON log saved under `data/migrations/` and `data/logs/migration-{id}.log.json`, downloadable from the UI.
-- **Legacy import** — if a `data/environments.json` file exists, the first account registered imports those environments (encrypted into the DB) and the file is renamed to `.imported`.
+- **Full migration history** — every migration and its complete log saved in Postgres, downloadable from the UI.
+- **Legacy import** — if a `data/environments.json` file exists (pre-Postgres installs), the first account registered imports those environments (encrypted into the DB) and the file is renamed to `.imported`.
+
+## Database
+
+Fully-managed mode persists to **Postgres** via [`@neondatabase/serverless`](https://www.npmjs.com/package/@neondatabase/serverless) — a natural fit for Vercel, which provisions Postgres as a native Neon integration (Storage tab → Create Database → Postgres). Connection string resolution: `DATABASE_URL` (pooled, set by the integration), falling back to `POSTGRES_URL` (legacy name, also set for back-compat). Schema (`users`, `sessions`, `environments`, `migrations`, `migration_logs`) is created automatically on first use — no manual migration step needed.
+
+For local development: provision the database in the Vercel dashboard, then run `vercel env pull .env.local` to bring `DATABASE_URL` into your local `.env.local` (or copy it manually from the dashboard).
+
+One-time mode remains fully in-memory (`lib/store/ephemeral.ts`) and never touches Postgres or disk.
 
 ## Features (both modes)
 
@@ -36,12 +44,13 @@ Register with email & password to unlock the full experience:
 ## Getting started
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
-Requires **Node.js 22.5+** (for the built-in SQLite module). Open http://localhost:3000 and
-choose a mode from the landing page. Tip: run your first migration with **Dry run** enabled.
+Open http://localhost:3000 and choose a mode from the landing page. Tip: run your first
+migration with **Dry run** enabled. Fully-managed mode requires `DATABASE_URL` to be set —
+see [Database](#database).
 
 ## How the transfer works
 
@@ -56,6 +65,7 @@ paths there and adjust if needed — each one can also be overridden with an env
 
 | Variable | Default |
 | --- | --- |
+| `DATABASE_URL` | *(none — see [Database](#database))* Postgres connection string |
 | `CT_SECRET_KEY` | *(none — see Security notes)* 64-hex-char AES-256 key for encrypting saved credentials |
 | `SITECORE_AUTHORITY` | `https://auth.sitecorecloud.io` |
 | `SITECORE_AUDIENCE` | `https://api.sitecorecloud.io` |
@@ -70,8 +80,8 @@ paths there and adjust if needed — each one can also be overridden with an env
 
 ## Security notes
 
-- Managed credentials are AES-256-GCM encrypted in SQLite. The key comes from the `CT_SECRET_KEY` environment variable (generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`). If unset in development, a key is auto-generated into `.env.local` (gitignored). A legacy `data/.secret.key` file is still honored for older installs. **Losing the key makes stored credentials unreadable.**
-- The `data/` folder (SQLite DB, logs) and all `.env*` files are gitignored — never commit them.
+- Managed credentials are AES-256-GCM encrypted before being stored in Postgres. The key comes from the `CT_SECRET_KEY` environment variable (generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`). If unset in development, a key is auto-generated into `.env.local` (gitignored). A legacy `data/.secret.key` file is still honored for older installs. **Losing the key makes stored credentials unreadable.**
+- All `.env*` files are gitignored — never commit them.
 - API routes for environments and managed migrations require a valid session and enforce per-user ownership.
 - One-time mode never persists tokens or logs; access tokens typically expire, so paste a fresh one per run.
 
@@ -82,9 +92,10 @@ app/                    Pages (landing/dashboard, login/register, one-time, envi
                         wizard, history, detail) + API routes (incl. /api/auth, /api/onetime)
 components/             UI components (shadcn-style) + timeline, log viewer, item tree
 lib/sitecore/           API clients: auth (client-credentials or token), CT & IT APIs, browsing
-lib/db.ts, crypto.ts    SQLite (node:sqlite) + scrypt password hashing + AES-256-GCM
+lib/postgres.ts         Neon/Postgres client + lazy schema init (users, sessions, environments, migrations, migration_logs)
+lib/crypto.ts           scrypt password hashing + AES-256-GCM encryption
 lib/session.ts          Cookie sessions
-lib/store/              environments (SQLite, encrypted), migrations/logs (disk), ephemeral (RAM)
+lib/store/              environments (Postgres, encrypted), migrations/logs (Postgres), ephemeral (RAM)
 lib/runner.ts           Migration pipeline orchestrator (managed + one-time, live + dry-run)
-data/                   Created at runtime: app.db, .secret.key, migrations/, logs/
+data/                   Only used for one-time legacy import of a pre-Postgres environments.json, if present
 ```

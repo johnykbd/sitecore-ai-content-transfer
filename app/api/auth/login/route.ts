@@ -4,7 +4,7 @@ import { authenticateUser, createSession } from "@/lib/session";
 export async function POST(req: NextRequest) {
   try {
     const { email, password } = await req.json();
-    const user = authenticateUser(email ?? "", password ?? "");
+    const user = await authenticateUser(email ?? "", password ?? "");
     await createSession(user.id);
     return NextResponse.json({ user });
   } catch (e) {

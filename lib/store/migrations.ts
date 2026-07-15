@@ -1,47 +1,43 @@
-import path from "path";
-import { promises as fs } from "fs";
 import type { LogEntry, Migration } from "../types";
-import { LOGS_DIR, MIGRATIONS_DIR, ensureDirs, readJson, writeJson } from "./files";
-
-function migrationFile(id: string) {
-  return path.join(MIGRATIONS_DIR, `${id}.json`);
-}
-
-export function logFile(id: string) {
-  return path.join(LOGS_DIR, `migration-${id}.log.json`);
-}
+import { ensureSchema, getSql } from "../postgres";
 
 export async function listMigrations(userId?: string): Promise<Migration[]> {
-  await ensureDirs();
-  const files = await fs.readdir(MIGRATIONS_DIR).catch(() => [] as string[]);
-  const migrations = await Promise.all(
-    files
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => readJson<Migration | null>(path.join(MIGRATIONS_DIR, f), null))
-  );
-  return migrations
-    .filter((m): m is Migration => !!m)
-    .filter((m) => !userId || m.userId === userId || !m.userId) // legacy records without userId stay visible
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  await ensureSchema();
+  const sql = getSql();
+  const rows = (userId
+    ? await sql`SELECT data FROM migrations WHERE user_id = ${userId} OR user_id IS NULL ORDER BY created_at DESC`
+    : await sql`SELECT data FROM migrations ORDER BY created_at DESC`) as { data: Migration }[];
+  return rows.map((r) => r.data);
 }
 
 export async function getMigration(id: string): Promise<Migration | undefined> {
-  const m = await readJson<Migration | null>(migrationFile(id), null);
-  return m ?? undefined;
+  await ensureSchema();
+  const rows = (await getSql()`SELECT data FROM migrations WHERE id = ${id}`) as {
+    data: Migration;
+  }[];
+  return rows[0]?.data;
 }
 
 export async function saveMigration(migration: Migration) {
-  await writeJson(migrationFile(migration.id), migration);
+  await ensureSchema();
+  await getSql()`
+    INSERT INTO migrations (id, user_id, data, created_at)
+    VALUES (${migration.id}, ${migration.userId ?? null}, ${JSON.stringify(migration)}, ${migration.createdAt})
+    ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
+  `;
 }
 
 export async function appendLog(migrationId: string, entry: LogEntry) {
-  await ensureDirs();
-  const file = logFile(migrationId);
-  const entries = await readJson<LogEntry[]>(file, []);
-  entries.push(entry);
-  await writeJson(file, entries);
+  await ensureSchema();
+  await getSql()`
+    INSERT INTO migration_logs (migration_id, entry) VALUES (${migrationId}, ${JSON.stringify(entry)})
+  `;
 }
 
 export async function readLogs(migrationId: string): Promise<LogEntry[]> {
-  return readJson<LogEntry[]>(logFile(migrationId), []);
+  await ensureSchema();
+  const rows = (await getSql()`
+    SELECT entry FROM migration_logs WHERE migration_id = ${migrationId} ORDER BY id
+  `) as { entry: LogEntry }[];
+  return rows.map((r) => r.entry);
 }

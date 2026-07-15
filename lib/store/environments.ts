@@ -1,13 +1,13 @@
 /**
  * Environment profiles for the fully-managed mode.
- * Stored per-user in SQLite; credentials (client id/secret or token)
+ * Stored per-user in Postgres; credentials (client id/secret or token)
  * are encrypted at rest with AES-256-GCM.
  */
 import { randomUUID } from "crypto";
 import { existsSync, readFileSync, renameSync } from "fs";
 import path from "path";
 import type { EnvironmentAuthType, EnvironmentProfile } from "../types";
-import { getDb } from "../db";
+import { ensureSchema, getSql } from "../postgres";
 import { decrypt, encrypt } from "../crypto";
 
 interface EnvRow {
@@ -50,9 +50,10 @@ function rowToEnv(row: EnvRow): EnvironmentProfile {
 }
 
 export async function listEnvironments(userId: string): Promise<EnvironmentProfile[]> {
-  const rows = getDb()
-    .prepare("SELECT * FROM environments WHERE user_id = ? ORDER BY created_at")
-    .all(userId) as unknown as EnvRow[];
+  await ensureSchema();
+  const rows = (await getSql()`
+    SELECT * FROM environments WHERE user_id = ${userId} ORDER BY created_at
+  `) as unknown as EnvRow[];
   return rows.map(rowToEnv);
 }
 
@@ -60,9 +61,9 @@ export async function getEnvironment(
   id: string,
   userId?: string
 ): Promise<EnvironmentProfile | undefined> {
-  const row = getDb().prepare("SELECT * FROM environments WHERE id = ?").get(id) as
-    | EnvRow
-    | undefined;
+  await ensureSchema();
+  const rows = (await getSql()`SELECT * FROM environments WHERE id = ${id}`) as unknown as EnvRow[];
+  const row = rows[0];
   if (!row) return undefined;
   if (userId && row.user_id !== userId) return undefined;
   return rowToEnv(row);
@@ -72,7 +73,8 @@ export async function saveEnvironment(
   input: Omit<EnvironmentProfile, "id" | "createdAt" | "updatedAt"> & { id?: string },
   userId: string
 ): Promise<EnvironmentProfile> {
-  const db = getDb();
+  await ensureSchema();
+  const sql = getSql();
   const now = new Date().toISOString();
 
   if (input.id) {
@@ -85,47 +87,35 @@ export async function saveEnvironment(
       clientSecret: input.clientSecret || existing.clientSecret,
       token: input.token || existing.token,
     };
-    db.prepare(
-      `UPDATE environments SET name=?, base_url=?, tag=?, auth_type=?, authority=?, audience=?, client_id=?, secret_enc=?, updated_at=? WHERE id=? AND user_id=?`
-    ).run(
-      merged.name,
-      merged.baseUrl,
-      merged.tag ?? null,
-      merged.authType,
-      merged.authority ?? null,
-      merged.audience ?? null,
-      merged.clientId ?? null,
-      encrypt(JSON.stringify({ clientSecret: merged.clientSecret, token: merged.token })),
-      now,
-      input.id,
-      userId
-    );
+    await sql`
+      UPDATE environments
+      SET name=${merged.name}, base_url=${merged.baseUrl}, tag=${merged.tag ?? null},
+          auth_type=${merged.authType}, authority=${merged.authority ?? null},
+          audience=${merged.audience ?? null}, client_id=${merged.clientId ?? null},
+          secret_enc=${encrypt(JSON.stringify({ clientSecret: merged.clientSecret, token: merged.token }))},
+          updated_at=${now}
+      WHERE id=${input.id} AND user_id=${userId}
+    `;
     return { ...merged, id: input.id, updatedAt: now };
   }
 
   const id = randomUUID();
-  db.prepare(
-    `INSERT INTO environments (id, user_id, name, base_url, tag, auth_type, authority, audience, client_id, secret_enc, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    userId,
-    input.name,
-    input.baseUrl,
-    input.tag ?? null,
-    input.authType ?? "clientCredentials",
-    input.authority ?? null,
-    input.audience ?? null,
-    input.clientId ?? null,
-    encrypt(JSON.stringify({ clientSecret: input.clientSecret, token: input.token })),
-    now,
-    now
-  );
+  await sql`
+    INSERT INTO environments (id, user_id, name, base_url, tag, auth_type, authority, audience, client_id, secret_enc, created_at, updated_at)
+    VALUES (
+      ${id}, ${userId}, ${input.name}, ${input.baseUrl}, ${input.tag ?? null},
+      ${input.authType ?? "clientCredentials"}, ${input.authority ?? null}, ${input.audience ?? null},
+      ${input.clientId ?? null},
+      ${encrypt(JSON.stringify({ clientSecret: input.clientSecret, token: input.token }))},
+      ${now}, ${now}
+    )
+  `;
   return { ...input, id, userId, createdAt: now, updatedAt: now };
 }
 
 export async function deleteEnvironment(id: string, userId: string) {
-  getDb().prepare("DELETE FROM environments WHERE id = ? AND user_id = ?").run(id, userId);
+  await ensureSchema();
+  await getSql()`DELETE FROM environments WHERE id = ${id} AND user_id = ${userId}`;
 }
 
 /** Strip secrets before sending to the browser. */

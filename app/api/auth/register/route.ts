@@ -5,7 +5,7 @@ import { importLegacyEnvironments } from "@/lib/store/environments";
 export async function POST(req: NextRequest) {
   try {
     const { email, password } = await req.json();
-    const user = registerUser(email ?? "", password ?? "");
+    const user = await registerUser(email ?? "", password ?? "");
     await createSession(user.id);
     // Import environments from a pre-SQLite data/environments.json, if present.
     const imported = await importLegacyEnvironments(user.id);
