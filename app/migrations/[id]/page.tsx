@@ -174,7 +174,8 @@ export default function MigrationDetailPage({
             <CardHeader>
               <CardTitle className="text-base">Migration log</CardTitle>
               <CardDescription>
-                Persisted to <span className="font-mono text-xs">data/logs/migration-{migration.id}.log.json</span>
+                Step-by-step record of every Sitecore API request and response (tokens redacted).
+                Expand a line to see the raw payload.
               </CardDescription>
             </CardHeader>
             <CardContent>

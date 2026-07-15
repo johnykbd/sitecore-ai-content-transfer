@@ -32,7 +32,7 @@ import {
   putEphemeralMigration,
   saveEphemeralMigration,
 } from "./store/ephemeral";
-import { SitecoreClient } from "./sitecore/client";
+import { SitecoreClient, type SitecoreCallLogger } from "./sitecore/client";
 import { ContentTransferApi } from "./sitecore/content-transfer";
 import { ItemTransferApi } from "./sitecore/item-transfer";
 import { getAccessToken } from "./sitecore/auth";
@@ -311,6 +311,24 @@ async function runMigration(id: string, mode: MigrationMode) {
   }
 }
 
+/**
+ * Every Sitecore HTTP call (request + response, tokens redacted) is logged
+ * against whichever step is currently running, so the migration log reads
+ * as a step-by-step record of exactly what was sent to/received from
+ * Sitecore — useful for debugging without exposing credentials.
+ */
+function makeHttpLogger(ctx: MigrationContext, stepRef: { current: string }): SitecoreCallLogger {
+  return (call) => {
+    const summary = call.error
+      ? `${call.method} ${call.url} → ${call.status ?? "ERR"} ${call.statusText ?? ""} (${call.durationMs}ms) — ${call.error}`
+      : `${call.method} ${call.url} → ${call.status ?? "-"} ${call.statusText ?? ""} (${call.durationMs}ms)`;
+    void ctx.log(call.error ? "warn" : "debug", stepRef.current, summary.trim(), {
+      request: call.requestBody,
+      response: call.responseBody,
+    });
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* Live transfer against real Sitecore environments                    */
 /* ------------------------------------------------------------------ */
@@ -320,6 +338,8 @@ async function runLiveTransfer(
 ) {
   const m = ctx.migration;
   const { source, destination } = envs;
+  const stepRef = { current: "validate" };
+  const httpLogger = makeHttpLogger(ctx, stepRef);
 
   // 1. validate
   await ctx.startStep("validate");
@@ -329,18 +349,21 @@ async function runLiveTransfer(
   );
 
   // 2-3. auth
+  stepRef.current = "auth-source";
   await ctx.startStep("auth-source");
-  await getAccessToken(source);
+  await getAccessToken(source, httpLogger);
   await ctx.completeStep("auth-source", source.baseUrl);
 
+  stepRef.current = "auth-destination";
   await ctx.startStep("auth-destination");
-  await getAccessToken(destination);
+  await getAccessToken(destination, httpLogger);
   await ctx.completeStep("auth-destination", destination.baseUrl);
 
-  const sourceApi = new ContentTransferApi(new SitecoreClient(source));
-  const destApi = new ItemTransferApi(new SitecoreClient(destination));
+  const sourceApi = new ContentTransferApi(new SitecoreClient(source, httpLogger));
+  const destApi = new ItemTransferApi(new SitecoreClient(destination, httpLogger));
 
   // 4. create transfer
+  stepRef.current = "create-transfer";
   await ctx.startStep("create-transfer");
   const created = await sourceApi.createTransfer(m.items, m.options, m.name);
   const transferId = created.transferId ?? created.id;
@@ -351,6 +374,7 @@ async function runLiveTransfer(
   await ctx.completeStep("create-transfer", `Transfer ${transferId}`);
 
   // 5. poll package build
+  stepRef.current = "build-package";
   await ctx.startStep("build-package");
   const buildStatus = await pollUntil(
     () => sourceApi.getStatus(m.transferId!),
@@ -369,6 +393,7 @@ async function runLiveTransfer(
   await ctx.completeStep("build-package");
 
   // 6. download package
+  stepRef.current = "download-package";
   await ctx.startStep("download-package");
   const pkg = await sourceApi.downloadPackage(m.transferId!);
   m.packageSizeBytes = pkg.byteLength;
@@ -376,6 +401,7 @@ async function runLiveTransfer(
   await ctx.completeStep("download-package", `${pkg.byteLength} bytes (.raif)`);
 
   // 7. upload to destination
+  stepRef.current = "upload-package";
   await ctx.startStep("upload-package");
   const uploaded = await destApi.uploadPackage(pkg, `${m.transferId}.raif`);
   const packageId = uploaded.packageId ?? uploaded.id ?? m.transferId!;
@@ -383,6 +409,7 @@ async function runLiveTransfer(
   await ctx.completeStep("upload-package", `Package ${packageId}`);
 
   // 8. consume
+  stepRef.current = "consume-package";
   await ctx.startStep("consume-package");
   await destApi.consumePackage(String(packageId), m.options.overwriteExisting);
   const consumeStatus = await pollUntil(
@@ -399,6 +426,7 @@ async function runLiveTransfer(
   await ctx.completeStep("consume-package");
 
   // 9. verify
+  stepRef.current = "verify";
   await ctx.startStep("verify");
   try {
     const items = await destApi.getPackageItems(String(packageId));

@@ -30,15 +30,27 @@ export function LogViewer({ logs, autoScroll = true }: { logs: LogEntry[]; autoS
   return (
     <div className="max-h-[420px] overflow-y-auto rounded-lg bg-zinc-950 p-4 font-mono text-xs leading-relaxed text-zinc-300">
       {logs.map((entry, i) => (
-        <div key={i} className="flex gap-3 whitespace-pre-wrap break-all py-0.5">
-          <span className="shrink-0 text-zinc-500">
-            {new Date(entry.ts).toLocaleTimeString()}
-          </span>
-          <span className={cn("shrink-0 w-14 uppercase", levelStyles[entry.level])}>
-            {entry.level}
-          </span>
-          <span className="shrink-0 w-36 truncate text-zinc-500">[{entry.step}]</span>
-          <span>{entry.message}</span>
+        <div key={i} className="py-0.5">
+          <div className="flex gap-3 whitespace-pre-wrap break-all">
+            <span className="shrink-0 text-zinc-500">
+              {new Date(entry.ts).toLocaleTimeString()}
+            </span>
+            <span className={cn("shrink-0 w-14 uppercase", levelStyles[entry.level])}>
+              {entry.level}
+            </span>
+            <span className="shrink-0 w-36 truncate text-zinc-500">[{entry.step}]</span>
+            <span>{entry.message}</span>
+          </div>
+          {entry.data !== undefined && (
+            <details className="ml-6 mt-0.5">
+              <summary className="cursor-pointer text-zinc-500 hover:text-zinc-300">
+                request / response
+              </summary>
+              <pre className="mt-1 max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded bg-black/40 p-2 text-zinc-400">
+                {JSON.stringify(entry.data, null, 2)}
+              </pre>
+            </details>
+          )}
         </div>
       ))}
       <div ref={endRef} />
