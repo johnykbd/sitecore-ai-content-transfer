@@ -30,6 +30,7 @@ export type MigrationStatus =
   | "pending"
   | "running"
   | "completed"
+  | "unconfirmed"
   | "failed"
   | "cancelled";
 

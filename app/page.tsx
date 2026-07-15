@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/card";
 import { StatusBadge } from "@/components/status-badge";
 import {
+  AlertTriangle,
   ArrowRight,
   ArrowLeftRight,
   CheckCircle2,
@@ -129,6 +130,7 @@ export default function DashboardPage() {
 
   const loading = migrations === null || envs === null;
   const completed = migrations?.filter((m) => m.status === "completed").length ?? 0;
+  const unconfirmed = migrations?.filter((m) => m.status === "unconfirmed").length ?? 0;
   const failed = migrations?.filter((m) => m.status === "failed").length ?? 0;
   const runningList = migrations?.filter((m) => m.status === "running") ?? [];
   const recent = migrations?.slice(0, 5) ?? [];
@@ -137,6 +139,7 @@ export default function DashboardPage() {
     { label: "Environments", value: envs?.length ?? 0, icon: Server, color: "text-sky-500" },
     { label: "Running", value: runningList.length, icon: Loader2, color: "text-primary" },
     { label: "Completed", value: completed, icon: CheckCircle2, color: "text-emerald-500" },
+    { label: "Unconfirmed", value: unconfirmed, icon: AlertTriangle, color: "text-amber-500" },
     { label: "Failed", value: failed, icon: XCircle, color: "text-red-500" },
   ];
 
@@ -162,7 +165,7 @@ export default function DashboardPage() {
         </div>
       ) : (
         <>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
             {stats.map((s) => (
               <Card key={s.label}>
                 <CardContent className="flex items-center gap-4 py-5">

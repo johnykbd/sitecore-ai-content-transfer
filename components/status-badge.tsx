@@ -1,6 +1,6 @@
 import { Badge } from "@/components/ui/badge";
 import type { MigrationStatus } from "@/lib/types";
-import { CheckCircle2, CircleDashed, Loader2, XCircle, Ban } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, Loader2, XCircle, Ban } from "lucide-react";
 
 export function StatusBadge({ status }: { status: MigrationStatus }) {
   switch (status) {
@@ -8,6 +8,12 @@ export function StatusBadge({ status }: { status: MigrationStatus }) {
       return (
         <Badge variant="success">
           <CheckCircle2 className="h-3 w-3" /> Completed
+        </Badge>
+      );
+    case "unconfirmed":
+      return (
+        <Badge variant="warning">
+          <AlertTriangle className="h-3 w-3" /> Unconfirmed
         </Badge>
       );
     case "running":

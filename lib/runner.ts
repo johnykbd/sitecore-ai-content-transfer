@@ -20,6 +20,7 @@ import type {
   Migration,
   MigrationMode,
   MigrationOptions,
+  MigrationStatus,
   MigrationStep,
   SelectedItem,
 } from "./types";
@@ -292,10 +293,27 @@ async function runMigration(id: string, mode: MigrationMode) {
       const envs = await resolveEnvs(migration);
       await runLiveTransfer(ctx, envs);
     }
-    migration.status = "completed";
+    // runLiveTransfer sets migration.status itself when it can't positively
+    // confirm the import ("unconfirmed") - only default to "completed" here
+    // if it left status untouched (still "running"). Read through a cast:
+    // TS's control-flow narrowing otherwise still treats this as literally
+    // "running" from the assignment above, even after the awaited calls
+    // that mutate it via the shared `ctx`/`migration` reference.
+    const currentStatus = migration.status as MigrationStatus;
+    const outcomeStatus: MigrationStatus =
+      currentStatus === "running" ? "completed" : currentStatus;
+    migration.status = outcomeStatus;
     migration.finishedAt = new Date().toISOString();
     await ctx.save();
-    await ctx.log("success", "done", `Migration "${migration.name}" completed successfully.`);
+    if (outcomeStatus === "unconfirmed") {
+      await ctx.log(
+        "warn",
+        "done",
+        `Migration "${migration.name}" ran to completion but was NOT confirmed - do not treat this as a successful transfer. See the verify step above.`
+      );
+    } else {
+      await ctx.log("success", "done", `Migration "${migration.name}" completed successfully.`);
+    }
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
     const runningStep = migration.steps.find((s) => s.status === "running");
@@ -423,18 +441,55 @@ async function runLiveTransfer(
     m.itemsTransferred = consumeStatus.itemsConsumed;
   }
   await ctx.save();
+  await ctx.log(
+    "warn",
+    "consume-package",
+    "Destination reports the package was accepted for import - this is NOT yet proof the item import finished. Confirming against the destination next..."
+  );
   await ctx.completeStep("consume-package");
 
   // 9. verify
+  //
+  // A "completed" consume status only means the destination accepted the
+  // package - it does not mean the items actually landed. Only mark the
+  // migration "completed" if inspecting the destination positively confirms
+  // items are present; any failure or empty/ambiguous result is reported as
+  // "unconfirmed" rather than silently treated as success.
   stepRef.current = "verify";
   await ctx.startStep("verify");
+  let verified = false;
+  let verifyDetail: string;
   try {
     const items = await destApi.getPackageItems(String(packageId));
-    await ctx.log("info", "verify", "Transferred items inspected on destination", items);
+    const list = Array.isArray(items)
+      ? items
+      : Array.isArray((items as { items?: unknown[] })?.items)
+        ? (items as { items: unknown[] }).items
+        : null;
+    if (list && list.length > 0) {
+      verified = true;
+      m.itemsTransferred = list.length;
+      verifyDetail = `Confirmed: ${list.length} item(s) present on destination`;
+      await ctx.log("success", "verify", verifyDetail, items);
+    } else {
+      verifyDetail = "Destination returned no items for this package - completion could NOT be confirmed";
+      await ctx.log("warn", "verify", verifyDetail, items);
+    }
   } catch (e) {
-    await ctx.log("warn", "verify", `Item inspection not available: ${(e as Error).message}`);
+    verifyDetail = `Item inspection failed (${(e as Error).message}) - completion could NOT be confirmed`;
+    await ctx.log("warn", "verify", verifyDetail);
   }
-  await ctx.completeStep("verify");
+  await ctx.completeStep("verify", verifyDetail);
+
+  if (!verified) {
+    m.status = "unconfirmed";
+    await ctx.save();
+    await ctx.log(
+      "warn",
+      "verify",
+      "This migration is NOT confirmed complete. The destination accepted the package, but item inspection could not verify the items actually landed. Check the destination content tree manually before treating this as done."
+    );
+  }
 }
 
 function normalizeStatus(status?: string): "pending" | "completed" | "failed" {
