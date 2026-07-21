@@ -1,12 +1,16 @@
 /**
  * Central configuration for all Sitecore API endpoints.
  *
- * All paths are kept in one place so they can be adjusted easily against
- * the official docs:
- *   - https://api-docs.sitecore.com/sai/content-transfer-api  (runs on the SOURCE environment)
- *   - https://api-docs.sitecore.com/sai/item-transfer-api     (runs on the DESTINATION environment)
+ * Paths verified against a working end-to-end shell script (based on the
+ * official walkthrough: doc.sitecore.com → "Migrate content between
+ * SitecoreAI environments"):
+ *   - Content Transfer API base: /sitecore/api/content/transfer/v1
+ *     (used on the SOURCE for create/status/chunk-download, and on the
+ *      DESTINATION for chunk-upload/complete — same paths, different hosts)
+ *   - Item Transfer API base:    /sitecore/shell/api/v3/ItemsTransfer
+ *     (DESTINATION only: blob state, consume, transfers list/detail)
  *
- * Every value can be overridden with an environment variable.
+ * Every value can still be overridden with an environment variable.
  */
 
 export const sitecoreConfig = {
@@ -15,25 +19,32 @@ export const sitecoreConfig = {
   tokenPath: process.env.SITECORE_TOKEN_PATH ?? "/oauth/token",
   audience: process.env.SITECORE_AUDIENCE ?? "https://api.sitecorecloud.io",
 
-  /** Content Transfer API (source environment) - creates and manages transfer packages. */
+  /** Content Transfer API — chunk packaging & movement. */
   contentTransfer: {
     base: process.env.SITECORE_CT_BASE ?? "/sitecore/api/content/transfer/v1",
-    transfers: "/transfers", // POST create transfer, GET list
+    transfers: "/transfers",
+    transfer: (transferId: string) => `/transfers/${transferId}`,
     transferStatus: (transferId: string) => `/transfers/${transferId}/status`,
-    transferPackage: (transferId: string) => `/transfers/${transferId}/package`,
-    transferChunks: (transferId: string) => `/transfers/${transferId}/chunks`,
-    cancel: (transferId: string) => `/transfers/${transferId}/cancel`,
+    chunk: (transferId: string, chunkSetId: string, chunk: number) =>
+      `/transfers/${transferId}/chunksets/${chunkSetId}/chunks/${chunk}`,
+    completeChunkSet: (transferId: string, chunkSetId: string) =>
+      `/transfers/${transferId}/chunksets/${chunkSetId}/complete`,
   },
 
-  /** Item Transfer API (destination environment) - consumes transfer packages. */
+  /** Item Transfer API (destination environment) — imports the .raif blob. */
   itemTransfer: {
-    base: process.env.SITECORE_IT_BASE ?? "/sitecore/api/item/transfer/v1",
-    packages: "/packages", // POST upload package
-    consume: (packageId: string) => `/packages/${packageId}/consume`,
-    consumeStatus: (packageId: string) => `/packages/${packageId}/status`,
-    sources: "/sources", // GET/DELETE manage transfer sources
-    items: (packageId: string) => `/packages/${packageId}/items`, // inspect transferred items
+    base: process.env.SITECORE_IT_BASE ?? "/sitecore/shell/api/v3/ItemsTransfer",
+    blob: (blobName: string) => `/sources/blobs/${blobName}`,
+    startConsume: (database: string, blobName: string) =>
+      `/transfers/databases/${database}/sources?blobName=${encodeURIComponent(blobName)}`,
+    consumeMonitor: (database: string, blobName: string) =>
+      `/transfers/databases/${database}/sources/${blobName}`,
+    transfers: "/transfers",
+    transferDetail: (id: string) => `/transfers/${encodeURIComponent(id)}`,
   },
+
+  /** Default database for transfers. */
+  database: process.env.SITECORE_DATABASE ?? "master",
 
   /** Authoring GraphQL API - used to browse the content tree in the item picker. */
   authoringGraphQL:
@@ -41,7 +52,7 @@ export const sitecoreConfig = {
 
   /** Polling behaviour. */
   polling: {
-    intervalMs: Number(process.env.SITECORE_POLL_INTERVAL ?? 3000),
-    maxAttempts: Number(process.env.SITECORE_POLL_MAX_ATTEMPTS ?? 200),
+    intervalMs: Number(process.env.SITECORE_POLL_INTERVAL ?? 5000),
+    maxAttempts: Number(process.env.SITECORE_POLL_MAX_ATTEMPTS ?? 60),
   },
 };

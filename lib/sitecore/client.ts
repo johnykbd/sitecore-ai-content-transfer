@@ -40,6 +40,15 @@ export function truncateForLog(value: unknown): unknown {
   };
 }
 
+export interface RawResponse<T = unknown> {
+  status: number;
+  ok: boolean;
+  headers: Headers;
+  /** Parsed JSON when the body is JSON, otherwise the raw text. */
+  body: T | string | null;
+  text: string;
+}
+
 /** Minimal authenticated HTTP client bound to one environment. */
 export class SitecoreClient {
   constructor(
@@ -56,21 +65,29 @@ export class SitecoreClient {
     return { Authorization: `Bearer ${token}`, ...extra };
   }
 
-  async request<T = unknown>(
+  /** Absolute URLs (e.g. Location-header monitor resources) pass through untouched. */
+  private resolve(path: string) {
+    return path.startsWith("http") ? path : `${this.baseUrl}${path}`;
+  }
+
+  /**
+   * Raw request: never throws on non-2xx — callers check `status` themselves,
+   * because this API pipeline treats specific codes (202, 201, 404…) as
+   * meaningful signals rather than plain success/failure.
+   */
+  async raw<T = unknown>(
     path: string,
     init: RequestInit & { json?: unknown } = {}
-  ): Promise<T> {
+  ): Promise<RawResponse<T>> {
     const { json, ...rest } = init;
     const method = rest.method ?? "GET";
-    const url = `${this.baseUrl}${path}`;
+    const url = this.resolve(path);
     const requestBody =
       json !== undefined
         ? json
-        : rest.body instanceof FormData
-          ? "<form-data upload>"
-          : typeof rest.body === "string"
-            ? rest.body
-            : undefined;
+        : typeof rest.body === "string"
+          ? rest.body
+          : undefined;
 
     const headers = await this.headers(
       json !== undefined ? { "Content-Type": "application/json" } : undefined
@@ -90,23 +107,18 @@ export class SitecoreClient {
       });
       status = res.status;
       statusText = res.statusText;
-
+      const text = await res.text().catch(() => "");
+      let body: T | string | null = text || null;
+      try {
+        if (text) body = JSON.parse(text) as T;
+      } catch {
+        /* keep raw text */
+      }
+      responseBody = body;
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        responseBody = body;
-        errorMessage = `${method} ${path} failed (${res.status} ${res.statusText})`;
-        throw new SitecoreApiError(errorMessage, res.status, body.slice(0, 1000));
+        errorMessage = `${method} ${url} → ${res.status} ${res.statusText}`;
       }
-
-      const contentType = res.headers.get("content-type") ?? "";
-      if (contentType.includes("application/json")) {
-        const data = await res.json();
-        responseBody = data;
-        return data as T;
-      }
-      const text = await res.text();
-      responseBody = text;
-      return text as unknown as T;
+      return { status: res.status, ok: res.ok, headers: res.headers, body, text };
     } finally {
       this.onCall?.({
         method,
@@ -121,9 +133,26 @@ export class SitecoreClient {
     }
   }
 
-  async requestBinary(path: string): Promise<ArrayBuffer> {
+  /** Strict request: throws on non-2xx, returns parsed JSON. */
+  async request<T = unknown>(
+    path: string,
+    init: RequestInit & { json?: unknown } = {}
+  ): Promise<T> {
+    const res = await this.raw<T>(path, init);
+    if (!res.ok) {
+      throw new SitecoreApiError(
+        `${init.method ?? "GET"} ${path} failed (HTTP ${res.status})`,
+        res.status,
+        res.text.slice(0, 1000)
+      );
+    }
+    return res.body as T;
+  }
+
+  /** Binary download that also exposes response headers (Content-Disposition etc.). */
+  async downloadBinary(path: string): Promise<{ data: ArrayBuffer; headers: Headers }> {
     const headers = await this.headers();
-    const url = `${this.baseUrl}${path}`;
+    const url = this.resolve(path);
     const started = Date.now();
     let status: number | undefined;
     let statusText: string | undefined;
@@ -135,12 +164,17 @@ export class SitecoreClient {
       status = res.status;
       statusText = res.statusText;
       if (!res.ok) {
-        errorMessage = `GET ${path} failed (${res.status} ${res.statusText})`;
-        throw new SitecoreApiError(errorMessage, res.status);
+        const body = await res.text().catch(() => "");
+        errorMessage = `GET ${url} → ${res.status} ${res.statusText}`;
+        throw new SitecoreApiError(
+          `GET ${path} failed (HTTP ${res.status})`,
+          res.status,
+          body.slice(0, 1000)
+        );
       }
       const buf = await res.arrayBuffer();
       byteLength = buf.byteLength;
-      return buf;
+      return { data: buf, headers: res.headers };
     } finally {
       this.onCall?.({
         method: "GET",
@@ -149,6 +183,44 @@ export class SitecoreClient {
         statusText,
         responseBody:
           byteLength !== undefined ? `<binary, ${byteLength} bytes>` : undefined,
+        durationMs: Date.now() - started,
+        error: errorMessage,
+      });
+    }
+  }
+
+  /** Binary upload (PUT application/octet-stream). Returns the raw response. */
+  async uploadBinary(path: string, data: ArrayBuffer): Promise<RawResponse> {
+    const headers = await this.headers({ "Content-Type": "application/octet-stream" });
+    const url = this.resolve(path);
+    const started = Date.now();
+    let status: number | undefined;
+    let statusText: string | undefined;
+    let responseBody: unknown;
+    let errorMessage: string | undefined;
+
+    try {
+      const res = await fetch(url, { method: "PUT", headers, body: data });
+      status = res.status;
+      statusText = res.statusText;
+      const text = await res.text().catch(() => "");
+      let body: unknown = text || null;
+      try {
+        if (text) body = JSON.parse(text);
+      } catch {
+        /* keep raw text */
+      }
+      responseBody = body;
+      if (!res.ok) errorMessage = `PUT ${url} → ${res.status} ${res.statusText}`;
+      return { status: res.status, ok: res.ok, headers: res.headers, body, text };
+    } finally {
+      this.onCall?.({
+        method: "PUT",
+        url,
+        requestBody: `<binary, ${data.byteLength} bytes>`,
+        status,
+        statusText,
+        responseBody: truncateForLog(responseBody),
         durationMs: Date.now() - started,
         error: errorMessage,
       });

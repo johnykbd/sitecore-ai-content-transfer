@@ -10,6 +10,12 @@ export function StatusBadge({ status }: { status: MigrationStatus }) {
           <CheckCircle2 className="h-3 w-3" /> Completed
         </Badge>
       );
+    case "completedWithIssues":
+      return (
+        <Badge variant="warning">
+          <AlertTriangle className="h-3 w-3" /> Finished with issues
+        </Badge>
+      );
     case "unconfirmed":
       return (
         <Badge variant="warning">

@@ -29,7 +29,11 @@ export interface EnvironmentProfile {
 export type MigrationStatus =
   | "pending"
   | "running"
+  /** TransferState=Finished, no ValidationErrors, item counts match. */
   | "completed"
+  /** TransferState=Finished but ValidationErrors present or counts mismatch. */
+  | "completedWithIssues"
+  /** Blob was Consumed but the API never reported TransferState=Finished — NOT a success. */
   | "unconfirmed"
   | "failed"
   | "cancelled";
@@ -95,6 +99,12 @@ export interface Migration {
   transferId?: string;
   packageSizeBytes?: number;
   itemsTransferred?: number;
+  /** Total items reported by the destination transfer detail (when available). */
+  itemsTotal?: number;
+  /** The .raif blob name produced by completing the chunk set on the destination. */
+  raifFile?: string;
+  /** Final TransferState reported by the destination transfers list. */
+  confirmedTransferState?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

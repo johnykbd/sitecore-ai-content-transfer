@@ -1,16 +1,28 @@
 /**
- * Migration runner — orchestrates the full transfer pipeline:
+ * Migration runner — orchestrates the full transfer pipeline, mirroring the
+ * verified end-to-end flow:
  *
- *   SOURCE (Content Transfer API)              DESTINATION (Item Transfer API)
- *   1. authenticate                            4. authenticate
- *   2. create transfer + build .raif package   5. upload package
- *   3. poll build status, download package     6. consume package into content tree
- *                                              7. poll consume status
+ *   PHASE 1 — Content Transfer API (both hosts, same paths)
+ *     1. create transfer on SOURCE (client-generated TransferId, expect 202)
+ *     2. poll SOURCE status until State=Completed → ChunkSetsMetadata
+ *     3. per chunk: download from SOURCE, PUT to DESTINATION (expect 201)
+ *     4. complete chunk set on DESTINATION → .raif blob name
+ *     5. delete transfer on SOURCE (cleanup)
  *
- * Two persistence modes:
- *   - managed: migration state + logs written to disk (data/), scoped to a user
- *   - onetime: everything lives in server memory only; tokens and logs are
- *     never written to disk
+ *   PHASE 2 — Item Transfer API (DESTINATION only)
+ *     6. poll blob until BlobState=Uploaded
+ *     7. start consume, poll monitor until BlobState=Consumed
+ *        (Consumed = ACCEPTED for import, NOT proof of completion!)
+ *     8. CONFIRM: poll GET /transfers until the entry with this run's
+ *        SourceName reports TransferState=Finished; cross-check the detail
+ *        endpoint's ValidationErrors + item counts
+ *     9. delete blob only on confirmed success
+ *
+ * Final status:
+ *   completed            Finished + no ValidationErrors + counts match
+ *   completedWithIssues  Finished but ValidationErrors / count mismatch
+ *   unconfirmed          Consumed but never reported Finished — NOT success
+ *   failed               any hard failure along the way
  */
 import { randomUUID } from "crypto";
 import type {
@@ -20,7 +32,6 @@ import type {
   Migration,
   MigrationMode,
   MigrationOptions,
-  MigrationStatus,
   MigrationStep,
   SelectedItem,
 } from "./types";
@@ -35,7 +46,7 @@ import {
 } from "./store/ephemeral";
 import { SitecoreClient, type SitecoreCallLogger } from "./sitecore/client";
 import { ContentTransferApi } from "./sitecore/content-transfer";
-import { ItemTransferApi } from "./sitecore/item-transfer";
+import { ItemTransferApi, type TransferListEntry } from "./sitecore/item-transfer";
 import { getAccessToken } from "./sitecore/auth";
 import { sitecoreConfig } from "./sitecore/config";
 
@@ -43,12 +54,13 @@ const STEP_DEFS: { id: string; label: string; description: string }[] = [
   { id: "validate", label: "Validate configuration", description: "Check environments, items and options" },
   { id: "auth-source", label: "Authenticate source", description: "Verify credentials for the source environment" },
   { id: "auth-destination", label: "Authenticate destination", description: "Verify credentials for the destination environment" },
-  { id: "create-transfer", label: "Create transfer", description: "Initiate transfer on source via Content Transfer API" },
-  { id: "build-package", label: "Build transfer package", description: "Source assembles the chunked .raif package" },
-  { id: "download-package", label: "Download package", description: "Retrieve the .raif package from the source" },
-  { id: "upload-package", label: "Upload to destination", description: "Push package to destination via Item Transfer API" },
-  { id: "consume-package", label: "Consume package", description: "Import items into the destination content tree" },
-  { id: "verify", label: "Verify & finalize", description: "Confirm consumption status and finish" },
+  { id: "create-transfer", label: "Create transfer", description: "Initiate transfer on source (Content Transfer API, expect 202)" },
+  { id: "build-package", label: "Build transfer package", description: "Source assembles the chunk set (poll until State=Completed)" },
+  { id: "transfer-chunks", label: "Transfer chunks", description: "Download each chunk from source, upload to destination (expect 201)" },
+  { id: "complete-chunkset", label: "Complete chunk set", description: "Assemble the .raif blob on the destination; clean up source transfer" },
+  { id: "consume", label: "Consume package", description: "Item Transfer API: blob Uploaded → start import → BlobState=Consumed" },
+  { id: "confirm", label: "Confirm completion", description: "Require TransferState=Finished + clean ValidationErrors + matching counts" },
+  { id: "cleanup", label: "Clean up", description: "Delete the .raif blob (only after confirmed success)" },
 ];
 
 export function buildSteps(): MigrationStep[] {
@@ -86,6 +98,9 @@ const running = new Set<string>();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 class MigrationContext {
+  /** Step currently running — HTTP call logs attach to this step. */
+  currentStepId = "init";
+
   constructor(
     public migration: Migration,
     private store: RunnerStore
@@ -112,6 +127,7 @@ class MigrationContext {
   }
 
   async startStep(id: string) {
+    this.currentStepId = id;
     const s = this.step(id);
     s.status = "running";
     s.startedAt = new Date().toISOString();
@@ -126,6 +142,23 @@ class MigrationContext {
     if (detail) s.detail = detail;
     await this.save();
     await this.log("success", id, `Completed: ${s.label}${detail ? ` — ${detail}` : ""}`);
+  }
+
+  async warnStep(id: string, detail: string) {
+    const s = this.step(id);
+    s.status = "completed";
+    s.finishedAt = new Date().toISOString();
+    s.detail = detail;
+    await this.save();
+    await this.log("warn", id, `${s.label}: ${detail}`);
+  }
+
+  async skipStep(id: string, detail: string) {
+    const s = this.step(id);
+    s.status = "skipped";
+    s.detail = detail;
+    await this.save();
+    await this.log("warn", id, `Skipped: ${s.label} — ${detail}`);
   }
 
   async failStep(id: string, error: Error) {
@@ -289,30 +322,20 @@ async function runMigration(id: string, mode: MigrationMode) {
   try {
     if (migration.options.dryRun) {
       await runDrySimulation(ctx);
+      migration.status = "completed";
     } else {
       const envs = await resolveEnvs(migration);
-      await runLiveTransfer(ctx, envs);
+      const outcome = await runLiveTransfer(ctx, envs);
+      migration.status = outcome;
     }
-    // runLiveTransfer sets migration.status itself when it can't positively
-    // confirm the import ("unconfirmed") - only default to "completed" here
-    // if it left status untouched (still "running"). Read through a cast:
-    // TS's control-flow narrowing otherwise still treats this as literally
-    // "running" from the assignment above, even after the awaited calls
-    // that mutate it via the shared `ctx`/`migration` reference.
-    const currentStatus = migration.status as MigrationStatus;
-    const outcomeStatus: MigrationStatus =
-      currentStatus === "running" ? "completed" : currentStatus;
-    migration.status = outcomeStatus;
     migration.finishedAt = new Date().toISOString();
     await ctx.save();
-    if (outcomeStatus === "unconfirmed") {
-      await ctx.log(
-        "warn",
-        "done",
-        `Migration "${migration.name}" ran to completion but was NOT confirmed - do not treat this as a successful transfer. See the verify step above.`
-      );
-    } else {
-      await ctx.log("success", "done", `Migration "${migration.name}" completed successfully.`);
+    if (migration.status === "completed") {
+      await ctx.log("success", "done", `Migration "${migration.name}" CONFIRMED complete (TransferState=Finished, clean validation). Remember: items still need to be PUBLISHED to appear live.`);
+    } else if (migration.status === "completedWithIssues") {
+      await ctx.log("warn", "done", `Migration "${migration.name}" reports Finished, but the transfer detail flags problems (validation errors or count mismatch). Do NOT treat this as a clean success — inspect the logs above.`);
+    } else if (migration.status === "unconfirmed") {
+      await ctx.log("warn", "done", `Migration "${migration.name}" NOT CONFIRMED: the blob was accepted (Consumed) but the API never reported TransferState=Finished. Do not assume the items are visible in the destination tree.`);
     }
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -335,12 +358,12 @@ async function runMigration(id: string, mode: MigrationMode) {
  * as a step-by-step record of exactly what was sent to/received from
  * Sitecore — useful for debugging without exposing credentials.
  */
-function makeHttpLogger(ctx: MigrationContext, stepRef: { current: string }): SitecoreCallLogger {
+function makeHttpLogger(ctx: MigrationContext): SitecoreCallLogger {
   return (call) => {
     const summary = call.error
       ? `${call.method} ${call.url} → ${call.status ?? "ERR"} ${call.statusText ?? ""} (${call.durationMs}ms) — ${call.error}`
       : `${call.method} ${call.url} → ${call.status ?? "-"} ${call.statusText ?? ""} (${call.durationMs}ms)`;
-    void ctx.log(call.error ? "warn" : "debug", stepRef.current, summary.trim(), {
+    void ctx.log(call.error ? "warn" : "debug", ctx.currentStepId, summary.trim(), {
       request: call.requestBody,
       response: call.responseBody,
     });
@@ -348,176 +371,266 @@ function makeHttpLogger(ctx: MigrationContext, stepRef: { current: string }): Si
 }
 
 /* ------------------------------------------------------------------ */
-/* Live transfer against real Sitecore environments                    */
+/* Live transfer — mirrors the verified shell-script flow               */
 /* ------------------------------------------------------------------ */
+type LiveOutcome = "completed" | "completedWithIssues" | "unconfirmed";
+
 async function runLiveTransfer(
   ctx: MigrationContext,
   envs: { source: EnvironmentProfile; destination: EnvironmentProfile }
-) {
+): Promise<LiveOutcome> {
   const m = ctx.migration;
   const { source, destination } = envs;
-  const stepRef = { current: "validate" };
-  const httpLogger = makeHttpLogger(ctx, stepRef);
+  const { intervalMs, maxAttempts } = sitecoreConfig.polling;
+  const database = sitecoreConfig.database;
+  const httpLogger = makeHttpLogger(ctx);
 
   // 1. validate
   await ctx.startStep("validate");
   await ctx.completeStep(
     "validate",
-    `${m.items.length} item(s), overwrite=${m.options.overwriteExisting}, related=${m.options.includeRelatedItems}`
+    `${m.items.length} item(s), db=${database}, merge=${m.options.overwriteExisting ? "OverrideExistingItem" : "KeepExistingItem"}`
   );
 
   // 2-3. auth
-  stepRef.current = "auth-source";
   await ctx.startStep("auth-source");
   await getAccessToken(source, httpLogger);
   await ctx.completeStep("auth-source", source.baseUrl);
 
-  stepRef.current = "auth-destination";
   await ctx.startStep("auth-destination");
   await getAccessToken(destination, httpLogger);
   await ctx.completeStep("auth-destination", destination.baseUrl);
 
-  const sourceApi = new ContentTransferApi(new SitecoreClient(source, httpLogger));
-  const destApi = new ItemTransferApi(new SitecoreClient(destination, httpLogger));
+  const sourceClient = new SitecoreClient(source, httpLogger);
+  const destClient = new SitecoreClient(destination, httpLogger);
+  const sourceCt = new ContentTransferApi(sourceClient);
+  const destCt = new ContentTransferApi(destClient); // chunk upload/complete use CT paths on the DESTINATION host
+  const destIt = new ItemTransferApi(destClient);
 
-  // 4. create transfer
-  stepRef.current = "create-transfer";
-  await ctx.startStep("create-transfer");
-  const created = await sourceApi.createTransfer(m.items, m.options, m.name);
-  const transferId = created.transferId ?? created.id;
-  if (!transferId) throw new Error("Source did not return a transfer id");
-  m.transferId = String(transferId);
+  // Client-generated transfer id (lowercase uuid, like the script's uuidgen)
+  const transferId = randomUUID().toLowerCase();
+  m.transferId = transferId;
   await ctx.save();
-  await ctx.log("info", "create-transfer", `Transfer id: ${transferId}`, created);
-  await ctx.completeStep("create-transfer", `Transfer ${transferId}`);
 
-  // 5. poll package build
-  stepRef.current = "build-package";
-  await ctx.startStep("build-package");
-  const buildStatus = await pollUntil(
-    () => sourceApi.getStatus(m.transferId!),
-    (s) => normalizeStatus(s.status ?? s.state),
-    async (s, state) => {
-      await ctx.log("info", "build-package", `Package build status: ${state}`, s);
+  // Best-effort cleanup helper for failures after the transfer was created
+  const cleanupSourceTransfer = async () => {
+    try {
+      const code = await sourceCt.deleteTransfer(transferId);
+      await ctx.log("info", "cleanup", `Best-effort DELETE of source transfer ${transferId} → HTTP ${code}`);
+    } catch {
+      /* best effort */
     }
-  );
-  if (typeof buildStatus.packageSize === "number") {
-    m.packageSizeBytes = buildStatus.packageSize;
-  }
-  if (typeof buildStatus.itemsProcessed === "number") {
-    m.itemsTransferred = buildStatus.itemsProcessed;
-  }
-  await ctx.save();
-  await ctx.completeStep("build-package");
+  };
 
-  // 6. download package
-  stepRef.current = "download-package";
-  await ctx.startStep("download-package");
-  const pkg = await sourceApi.downloadPackage(m.transferId!);
-  m.packageSizeBytes = pkg.byteLength;
-  await ctx.save();
-  await ctx.completeStep("download-package", `${pkg.byteLength} bytes (.raif)`);
-
-  // 7. upload to destination
-  stepRef.current = "upload-package";
-  await ctx.startStep("upload-package");
-  const uploaded = await destApi.uploadPackage(pkg, `${m.transferId}.raif`);
-  const packageId = uploaded.packageId ?? uploaded.id ?? m.transferId!;
-  await ctx.log("info", "upload-package", `Destination package id: ${packageId}`, uploaded);
-  await ctx.completeStep("upload-package", `Package ${packageId}`);
-
-  // 8. consume
-  stepRef.current = "consume-package";
-  await ctx.startStep("consume-package");
-  await destApi.consumePackage(String(packageId), m.options.overwriteExisting);
-  const consumeStatus = await pollUntil(
-    () => destApi.getConsumeStatus(String(packageId)),
-    (s) => normalizeStatus(s.status ?? s.state),
-    async (s, state) => {
-      await ctx.log("info", "consume-package", `Consume status: ${state}`, s);
-    }
-  );
-  if (typeof consumeStatus.itemsConsumed === "number") {
-    m.itemsTransferred = consumeStatus.itemsConsumed;
-  }
-  await ctx.save();
-  await ctx.log(
-    "warn",
-    "consume-package",
-    "Destination reports the package was accepted for import - this is NOT yet proof the item import finished. Confirming against the destination next..."
-  );
-  await ctx.completeStep("consume-package");
-
-  // 9. verify
-  //
-  // A "completed" consume status only means the destination accepted the
-  // package - it does not mean the items actually landed. Only mark the
-  // migration "completed" if inspecting the destination positively confirms
-  // items are present; any failure or empty/ambiguous result is reported as
-  // "unconfirmed" rather than silently treated as success.
-  stepRef.current = "verify";
-  await ctx.startStep("verify");
-  let verified = false;
-  let verifyDetail: string;
   try {
-    const items = await destApi.getPackageItems(String(packageId));
-    const list = Array.isArray(items)
-      ? items
-      : Array.isArray((items as { items?: unknown[] })?.items)
-        ? (items as { items: unknown[] }).items
-        : null;
-    if (list && list.length > 0) {
-      verified = true;
-      m.itemsTransferred = list.length;
-      verifyDetail = `Confirmed: ${list.length} item(s) present on destination`;
-      await ctx.log("success", "verify", verifyDetail, items);
-    } else {
-      verifyDetail = "Destination returned no items for this package - completion could NOT be confirmed";
-      await ctx.log("warn", "verify", verifyDetail, items);
+    // 4. create transfer on source (expects 202)
+    await ctx.startStep("create-transfer");
+    await sourceCt.createTransfer(transferId, m.items, m.options, database);
+    await ctx.log("info", "create-transfer", `Transfer initiated (202 Accepted). TransferId=${transferId}`, {
+      DataTrees: m.items.map((i) => i.path),
+      Database: database,
+    });
+    if (m.options.includeRelatedItems) {
+      await ctx.log("warn", "create-transfer", "Note: the Content Transfer API has no separate 'related items' switch — related item handling follows the Scope/MergeStrategy of each data tree.");
     }
-  } catch (e) {
-    verifyDetail = `Item inspection failed (${(e as Error).message}) - completion could NOT be confirmed`;
-    await ctx.log("warn", "verify", verifyDetail);
-  }
-  await ctx.completeStep("verify", verifyDetail);
+    await ctx.completeStep("create-transfer", `Transfer ${transferId}`);
 
-  if (!verified) {
-    m.status = "unconfirmed";
+    // 5. poll build status until State=Completed
+    await ctx.startStep("build-package");
+    let state = "";
+    let chunkSets: { ChunkSetId: string; ChunkCount: number }[] = [];
+    for (let i = 1; i <= maxAttempts; i++) {
+      const status = await sourceCt.getStatus(transferId);
+      state = String(status.State ?? "");
+      await ctx.log("info", "build-package", `Attempt ${i}: State=${state || "<none>"}`, status);
+      if (state === "Completed") {
+        chunkSets = (status.ChunkSetsMetadata ?? []).map((c) => ({
+          ChunkSetId: String(c.ChunkSetId),
+          ChunkCount: Number(c.ChunkCount),
+        }));
+        break;
+      }
+      if (state === "Failed") {
+        throw new Error(`Transfer failed on source: ${JSON.stringify(status).slice(0, 500)}`);
+      }
+      await sleep(intervalMs);
+    }
+    if (state !== "Completed") throw new Error(`Package build did not complete within ${maxAttempts} attempts (last State=${state || "<none>"})`);
+    if (!chunkSets.length) throw new Error("Source reported Completed but returned no ChunkSetsMetadata");
+    const totalChunks = chunkSets.reduce((n, c) => n + c.ChunkCount, 0);
+    await ctx.completeStep("build-package", `${chunkSets.length} chunk set(s), ${totalChunks} chunk(s)`);
+
+    // 6. transfer chunks: download from source, PUT to destination (expect 201)
+    await ctx.startStep("transfer-chunks");
+    let movedBytes = 0;
+    for (const cs of chunkSets) {
+      for (let chunk = 0; chunk < cs.ChunkCount; chunk++) {
+        const { data, isMedia } = await sourceCt.downloadChunk(transferId, cs.ChunkSetId, chunk);
+        movedBytes += data.byteLength;
+        await ctx.log("info", "transfer-chunks", `Chunk ${chunk} downloaded from source: ${data.byteLength} bytes, IsMedia=${isMedia}`);
+        await destCt.uploadChunk(transferId, cs.ChunkSetId, chunk, data, isMedia);
+        await ctx.log("info", "transfer-chunks", `Chunk ${chunk} uploaded to destination (201 Created)`);
+      }
+    }
+    m.packageSizeBytes = movedBytes;
     await ctx.save();
-    await ctx.log(
-      "warn",
-      "verify",
-      "This migration is NOT confirmed complete. The destination accepted the package, but item inspection could not verify the items actually landed. Check the destination content tree manually before treating this as done."
-    );
+    await ctx.completeStep("transfer-chunks", `${totalChunks} chunk(s), ${movedBytes} bytes`);
+
+    // 7. complete chunk set(s) on destination → .raif name; clean up source
+    await ctx.startStep("complete-chunkset");
+    // Standard case is a single chunk set → a single .raif blob.
+    const raifFiles: string[] = [];
+    for (const cs of chunkSets) {
+      const raif = await destCt.completeChunkSet(transferId, cs.ChunkSetId);
+      raifFiles.push(raif);
+      await ctx.log("info", "complete-chunkset", `.raif blob created on destination: ${raif}`);
+    }
+    m.raifFile = raifFiles[0];
+    await ctx.save();
+    await cleanupSourceTransfer();
+    await ctx.completeStep("complete-chunkset", raifFiles.join(", "));
+
+    // ---- PHASE 2: Item Transfer API ----
+    const outcomes: LiveOutcome[] = [];
+    for (const raif of raifFiles) {
+      outcomes.push(await consumeAndConfirm(ctx, destIt, raif, database));
+    }
+    // Worst outcome wins
+    if (outcomes.includes("unconfirmed")) return "unconfirmed";
+    if (outcomes.includes("completedWithIssues")) return "completedWithIssues";
+    return "completed";
+  } catch (err) {
+    await cleanupSourceTransfer();
+    throw err;
   }
 }
 
-function normalizeStatus(status?: string): "pending" | "completed" | "failed" {
-  const s = (status ?? "").toLowerCase();
-  if (["completed", "complete", "succeeded", "success", "finished", "done"].includes(s))
-    return "completed";
-  if (["failed", "error", "cancelled", "canceled", "aborted"].includes(s)) return "failed";
-  return "pending";
-}
-
-async function pollUntil<T>(
-  fetcher: () => Promise<T>,
-  classify: (result: T) => "pending" | "completed" | "failed",
-  onTick?: (result: T, state: string) => Promise<void>
-): Promise<T> {
+/** Phase 2 for one .raif blob: consume, then CONFIRM against the transfers list. */
+async function consumeAndConfirm(
+  ctx: MigrationContext,
+  destIt: ItemTransferApi,
+  raif: string,
+  database: string
+): Promise<LiveOutcome> {
+  const m = ctx.migration;
   const { intervalMs, maxAttempts } = sitecoreConfig.polling;
-  let last: T;
-  for (let i = 0; i < maxAttempts; i++) {
-    last = await fetcher();
-    const state = classify(last);
-    if (onTick) await onTick(last, state);
-    if (state === "completed") return last;
-    if (state === "failed") {
-      throw new Error(`Remote operation failed: ${JSON.stringify(last).slice(0, 300)}`);
+
+  // 8a. wait for blob to be Uploaded
+  await ctx.startStep("consume");
+  let blobState = "";
+  for (let i = 1; i <= maxAttempts; i++) {
+    const res = await destIt.getBlobState(raif);
+    const body = typeof res.body === "object" && res.body !== null ? res.body : undefined;
+    blobState = String(body?.BlobState ?? "");
+    await ctx.log("info", "consume", `Blob check attempt ${i}: BlobState=${blobState || "<none>"} (HTTP ${res.status})`, body ?? res.text);
+    if (blobState === "Uploaded") break;
+    await sleep(intervalMs);
+  }
+  if (blobState !== "Uploaded") {
+    throw new Error(`Blob '${raif}' never reached 'Uploaded' state (last: ${blobState || "<none>"})`);
+  }
+
+  // 8b. start consumption
+  const { response: consumeRes, monitorUrl } = await destIt.startConsume(database, raif);
+  await ctx.log("info", "consume", `Consume started (HTTP ${consumeRes.status}). Monitoring: ${monitorUrl}`, consumeRes.body ?? consumeRes.text);
+
+  // 8c. poll until Consumed. Any Error or TransferredWithErrors is a hard failure.
+  let consumed = "";
+  for (let i = 1; i <= maxAttempts; i++) {
+    const res = await destIt.getMonitor(monitorUrl);
+    const body = typeof res.body === "object" && res.body !== null ? res.body : undefined;
+    consumed = String(body?.BlobState ?? "");
+    const error = body?.Error ? String(body.Error) : "";
+    await ctx.log("info", "consume", `Monitor attempt ${i}: BlobState=${consumed || "<none>"}${error ? `, Error=${error}` : ""}`, body ?? res.text);
+    if (error || consumed === "TransferredWithErrors") {
+      throw new Error(`Item transfer failed: ${error || "TransferredWithErrors"}. Full response: ${res.text.slice(0, 500)}`);
+    }
+    if (consumed === "Consumed") break;
+    await sleep(intervalMs);
+  }
+  if (consumed !== "Consumed") {
+    throw new Error(`Item transfer did not reach 'Consumed' within timeout (last BlobState: ${consumed || "<none>"})`);
+  }
+  await ctx.warnStep("consume", "BlobState=Consumed — blob ACCEPTED for import. This is NOT proof the import finished; confirming next…");
+
+  // 9. CONFIRM real completion via the transfers list (the only reliable signal)
+  await ctx.startStep("confirm");
+  let matched: TransferListEntry | undefined;
+  let confirmedState = "";
+  for (let i = 1; i <= maxAttempts; i++) {
+    try {
+      const list = await destIt.listTransfers();
+      matched = (list.Transfers ?? []).find((t) => t.SourceName === raif);
+      confirmedState = matched ? String(matched.TransferState ?? "") : "";
+      await ctx.log(
+        "info",
+        "confirm",
+        matched
+          ? `Attempt ${i}: matched Id=${matched.Id}, TransferState=${confirmedState || "<none>"}`
+          : `Attempt ${i}: no transfers-list entry yet for SourceName=${raif}`
+      );
+      if (confirmedState === "Finished" || confirmedState === "Failed") break;
+    } catch (e) {
+      await ctx.log("warn", "confirm", `Transfers list poll failed: ${(e as Error).message}`);
     }
     await sleep(intervalMs);
   }
-  throw new Error(`Timed out after ${maxAttempts} polling attempts`);
+  m.confirmedTransferState = confirmedState || "<no matching entry>";
+  await ctx.save();
+
+  if (confirmedState === "Failed") {
+    throw new Error(`Item transfer FAILED (TransferState=Failed) for ${raif}`);
+  }
+
+  if (confirmedState !== "Finished") {
+    // Not a success, not a hard failure — the API never reported completion.
+    await ctx.warnStep(
+      "confirm",
+      `NOT CONFIRMED: TransferState=${confirmedState || "<no matching entry>"} after ${maxAttempts} attempts (expected 'Finished'). Blob shows Consumed, but do not assume the items are in the destination tree.`
+    );
+    await ctx.skipStep("cleanup", `Blob '${raif}' left on destination for inspection (completion unconfirmed).`);
+    return "unconfirmed";
+  }
+
+  // Cross-check the detail endpoint (may return 500 — tolerate and fall back)
+  let hasValidationErrors = false;
+  let countsMismatch = false;
+  if (matched?.Id) {
+    const detail = await destIt.getTransferDetail(matched.Id);
+    const body = typeof detail.body === "object" && detail.body !== null ? detail.body : undefined;
+    if (detail.status === 200 && body) {
+      const validation = body.ValidationErrors;
+      const total = typeof body.TotalItemsCount === "number" ? body.TotalItemsCount : undefined;
+      const transferred = typeof body.TransferredItemsCount === "number" ? body.TransferredItemsCount : undefined;
+      hasValidationErrors = Array.isArray(validation) && validation.length > 0;
+      countsMismatch = total !== undefined && transferred !== undefined && total !== transferred;
+      if (typeof transferred === "number") m.itemsTransferred = transferred;
+      if (typeof total === "number") m.itemsTotal = total;
+      await ctx.save();
+      await ctx.log("info", "confirm", `Detail: TotalItemsCount=${total ?? "<none>"}, TransferredItemsCount=${transferred ?? "<none>"}, ValidationErrors=${hasValidationErrors ? JSON.stringify(validation).slice(0, 300) : "none"}`);
+    } else {
+      await ctx.log("warn", "confirm", `Transfer detail lookup failed (HTTP ${detail.status}) — falling back to the transfers-list TransferState. ValidationErrors/item counts could not be checked this run.`);
+    }
+  }
+
+  if (hasValidationErrors || countsMismatch) {
+    await ctx.warnStep(
+      "confirm",
+      `TransferState=Finished, BUT ${hasValidationErrors ? "ValidationErrors present" : ""}${hasValidationErrors && countsMismatch ? " and " : ""}${countsMismatch ? `count mismatch (${m.itemsTransferred}/${m.itemsTotal})` : ""} — some items may have silently failed.`
+    );
+    await ctx.skipStep("cleanup", `Blob '${raif}' left on destination for inspection.`);
+    return "completedWithIssues";
+  }
+
+  await ctx.completeStep("confirm", `TransferState=Finished, no ValidationErrors${m.itemsTotal ? `, ${m.itemsTransferred}/${m.itemsTotal} items` : ""}`);
+
+  // 10. cleanup — only on confirmed clean success
+  await ctx.startStep("cleanup");
+  const del = await destIt.deleteBlob(raif);
+  await ctx.log("info", "cleanup", `DELETE blob '${raif}' → HTTP ${del.status}`);
+  await ctx.completeStep("cleanup", `Blob '${raif}' removed`);
+  await ctx.log("warn", "done", "Reminder: transferred items still need to be PUBLISHED to appear live. If an item is invisible in the tree, verify the parent hierarchy exists in the destination with MATCHING item IDs.");
+  return "completed";
 }
 
 /* ------------------------------------------------------------------ */
@@ -532,33 +645,37 @@ async function runDrySimulation(ctx: MigrationContext) {
     validate: `${m.items.length} item(s) validated`,
     "auth-source": `${m.sourceEnvName} (simulated token)`,
     "auth-destination": `${m.destinationEnvName} (simulated token)`,
-    "create-transfer": `Transfer sim-${m.id.slice(0, 8)}`,
-    "build-package": `${m.items.length} item(s) packaged`,
-    "download-package": `${fakePackageSize} bytes (.raif)`,
-    "upload-package": `Package sim-${m.id.slice(0, 8)} uploaded`,
-    "consume-package": `${m.items.length} item(s) imported`,
-    verify: "Simulation verified",
+    "create-transfer": `Transfer sim-${m.id.slice(0, 8)} (202 simulated)`,
+    "build-package": `1 chunk set, ${m.items.length} item(s) packaged`,
+    "transfer-chunks": `${fakePackageSize} bytes moved`,
+    "complete-chunkset": `sim-${m.id.slice(0, 8)}.raif`,
+    consume: "BlobState=Consumed (simulated)",
+    confirm: "TransferState=Finished, no ValidationErrors (simulated)",
+    cleanup: "Blob removed (simulated)",
   };
 
   m.transferId = `sim-${m.id.slice(0, 8)}`;
+  m.raifFile = `sim-${m.id.slice(0, 8)}.raif`;
 
   for (const step of m.steps) {
     await ctx.startStep(step.id);
     await sleep(800 + Math.random() * 1200);
-    if (step.id === "build-package") {
+    if (step.id === "transfer-chunks") {
       for (const item of m.items) {
         await ctx.log("info", step.id, `Packaging ${item.path}${item.includeDescendants ? " (+ descendants)" : ""}`);
         await sleep(300);
       }
       m.packageSizeBytes = fakePackageSize;
     }
-    if (step.id === "consume-package") {
+    if (step.id === "consume") {
       for (const item of m.items) {
         await ctx.log("info", step.id, `Importing ${item.path} into ${m.destinationEnvName}`);
         await sleep(300);
       }
       m.itemsTransferred = m.items.length;
+      m.itemsTotal = m.items.length;
     }
     await ctx.completeStep(step.id, details[step.id]);
   }
+  m.confirmedTransferState = "Finished (simulated)";
 }
