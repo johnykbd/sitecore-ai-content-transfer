@@ -36,7 +36,7 @@ One-time mode remains fully in-memory (`lib/store/ephemeral.ts`) and never touch
 
 ## Features (both modes)
 
-- **Live progress timeline** — the 9-step pipeline (validate → authenticate source/destination → create transfer → build package → download `.raif` → upload → consume → verify) updates in real time.
+- **Live progress timeline** — the 10-step pipeline (validate → authenticate source/destination → create transfer → build package → transfer chunks → complete chunk set → consume → **confirm** → cleanup) updates in real time, with every Sitecore request/response attached to its step in the log viewer.
 - **Item selection** — browse the source content tree (Authoring GraphQL), add items by path, optionally include descendants.
 - **Options** — overwrite existing, include related items, publish after transfer, dry run.
 - **Dry run mode** — walks the entire pipeline with full logging but no live Sitecore calls. Great for demoing the UI. The item picker also has a "demo tree" toggle.
@@ -54,8 +54,25 @@ see [Database](#database).
 
 ## How the transfer works
 
-1. **Source (Content Transfer API)** — the app authenticates (OAuth client-credentials or your provided token), creates a transfer for the selected items, waits for the source to assemble the chunked `.raif` package, and downloads it.
-2. **Destination (Item Transfer API)** — the package is uploaded, consumed into the destination content tree, and the consumption status is polled until complete. Transferred items are inspected for verification.
+The pipeline mirrors the official SitecoreAI walkthrough ("Migrate content between SitecoreAI
+environments using APIs") end to end:
+
+1. **Create transfer (source, Content Transfer API)** — `POST /sitecore/api/content/transfer/v1/transfers` with a client-generated `TransferId` and a `Configuration` of `DataTrees` (`ItemPath`, `Scope: SingleItem | ItemAndDescendants`, `MergeStrategy: OverrideExistingItem | KeepExistingItem`) plus the `Database`. Expects **HTTP 202**.
+2. **Build package** — poll `GET /transfers/{id}/status` until `State=Completed`, collecting `ChunkSetsMetadata` (`ChunkSetId`, `ChunkCount`).
+3. **Transfer chunks** — for each chunk: `GET` it from the source (the `IsMedia` flag is parsed from the `Content-Disposition` header) and `PUT` it to the destination's Content Transfer API with `?isMedia=` kept paired per chunk. Expects **HTTP 201** per upload.
+4. **Complete chunk set** — `POST /transfers/{id}/chunksets/{chunkSetId}/complete` on the destination returns the `ContentTransferFileName` (`.raif` blob). The source transfer is then deleted.
+5. **Consume (destination, Item Transfer API — `/sitecore/shell/api/v3/ItemsTransfer`)** — poll `GET /sources/blobs/{raif}` until `BlobState=Uploaded`, then `POST /transfers/databases/{db}/sources?blobName={raif}` and poll the monitor URL (from the `Location` header) until `BlobState=Consumed`/`Transferred`. A non-null `Error` or `TransferredWithErrors` (terminal partial success) fails the run.
+6. **Confirm — the step most integrations skip.** `Consumed` only means the blob was *accepted*. The app polls `GET /transfers` until the entry whose `SourceName` matches the `.raif` reports `TransferState=Finished`, then cross-checks the detail endpoint for empty `ValidationErrors` and `TransferredItemsCount == TotalItemsCount`.
+7. **Cleanup** — the `.raif` blob is deleted **only after a confirmed clean success**; otherwise it is left on the destination for inspection.
+
+Resulting statuses are honest: **Completed** (confirmed clean), **Finished with issues**
+(`Finished` but validation errors / count mismatch), **Unconfirmed** (accepted but never
+reported `Finished` — not a success), or **Failed**.
+
+> **After a successful transfer:** items land unpublished — publish them to make them live.
+> If an item doesn't appear in the tree, verify its parent hierarchy exists in the destination
+> with **matching item IDs**. Access tokens are short-lived (~15 min); large transfers with
+> pasted tokens may need a fresh token.
 
 ## Configuration
 
@@ -70,10 +87,11 @@ paths there and adjust if needed — each one can also be overridden with an env
 | `SITECORE_AUTHORITY` | `https://auth.sitecorecloud.io` |
 | `SITECORE_AUDIENCE` | `https://api.sitecorecloud.io` |
 | `SITECORE_CT_BASE` | `/sitecore/api/content/transfer/v1` |
-| `SITECORE_IT_BASE` | `/sitecore/api/item/transfer/v1` |
+| `SITECORE_IT_BASE` | `/sitecore/shell/api/v3/ItemsTransfer` |
+| `SITECORE_DATABASE` | `master` |
 | `SITECORE_AUTHORING_GQL` | `/sitecore/api/authoring/graphql/v1` |
-| `SITECORE_POLL_INTERVAL` | `3000` (ms) |
-| `SITECORE_POLL_MAX_ATTEMPTS` | `200` |
+| `SITECORE_POLL_INTERVAL` | `5000` (ms) |
+| `SITECORE_POLL_MAX_ATTEMPTS` | `60` |
 
 > **Note:** using these APIs requires the Organization Admin or Organization Owner role in
 > Sitecore Cloud, and credentials/tokens with access to both environments.

@@ -534,7 +534,11 @@ async function consumeAndConfirm(
   const { response: consumeRes, monitorUrl } = await destIt.startConsume(database, raif);
   await ctx.log("info", "consume", `Consume started (HTTP ${consumeRes.status}). Monitoring: ${monitorUrl}`, consumeRes.body ?? consumeRes.text);
 
-  // 8c. poll until Consumed. Any Error or TransferredWithErrors is a hard failure.
+  // 8c. poll until the blob is accepted. Per the official walkthrough the
+  // monitor reports BlobState=Consumed (or Transferred on some versions) on a
+  // clean run; TransferredWithErrors is a TERMINAL partial-success state and
+  // any non-null Error is a hard failure.
+  const ACCEPTED_STATES = ["Consumed", "Transferred"];
   let consumed = "";
   for (let i = 1; i <= maxAttempts; i++) {
     const res = await destIt.getMonitor(monitorUrl);
@@ -543,15 +547,15 @@ async function consumeAndConfirm(
     const error = body?.Error ? String(body.Error) : "";
     await ctx.log("info", "consume", `Monitor attempt ${i}: BlobState=${consumed || "<none>"}${error ? `, Error=${error}` : ""}`, body ?? res.text);
     if (error || consumed === "TransferredWithErrors") {
-      throw new Error(`Item transfer failed: ${error || "TransferredWithErrors"}. Full response: ${res.text.slice(0, 500)}`);
+      throw new Error(`Item transfer failed: ${error || "TransferredWithErrors (partial success — review ValidationErrors in the transfer detail)"}. Full response: ${res.text.slice(0, 500)}`);
     }
-    if (consumed === "Consumed") break;
+    if (ACCEPTED_STATES.includes(consumed)) break;
     await sleep(intervalMs);
   }
-  if (consumed !== "Consumed") {
+  if (!ACCEPTED_STATES.includes(consumed)) {
     throw new Error(`Item transfer did not reach 'Consumed' within timeout (last BlobState: ${consumed || "<none>"})`);
   }
-  await ctx.warnStep("consume", "BlobState=Consumed — blob ACCEPTED for import. This is NOT proof the import finished; confirming next…");
+  await ctx.warnStep("consume", `BlobState=${consumed} — blob ACCEPTED for import. This is NOT proof the import finished; confirming next…`);
 
   // 9. CONFIRM real completion via the transfers list (the only reliable signal)
   await ctx.startStep("confirm");
